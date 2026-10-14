@@ -39,6 +39,7 @@ import {
     type NativeChatToolBundle,
 } from "./chat-engine";
 import type { CustomAppPromptProfile } from "./custom-app-types";
+import { IncompleteReplyError } from "./llm-stream-completion";
 import { isNeteaseConfigured } from "./music-service";
 import { buildCalendarScheduleMarker, getCurrentCalendarScheduleForPrompt } from "./calendar-storage";
 import { getWeekStartIso } from "./calendar-utils";
@@ -614,7 +615,8 @@ async function runNativeGroupToolLoop(params: {
         } catch (err) {
             if (finalRawOutput) {
                 throwIfAborted(signal);
-                callbacks?.onToolNotice?.(`⚠️ 回复生成失败: ${err instanceof Error ? err.message : String(err)}`);
+                if (err instanceof IncompleteReplyError && callbacks?.onIncompleteReply) callbacks.onIncompleteReply(err);
+                else callbacks?.onToolNotice?.(`⚠️ 回复生成失败: ${err instanceof Error ? err.message : String(err)}`);
                 break;
             }
             throw err;
@@ -869,7 +871,8 @@ export async function generateGroupChatCompletion(
         } catch (err) {
             if (finalRawOutput) {
                 throwIfAborted(options?.signal);
-                callbacks?.onToolNotice?.(`⚠️ 回复生成失败: ${err instanceof Error ? err.message : String(err)}`);
+                if (err instanceof IncompleteReplyError && callbacks?.onIncompleteReply) callbacks.onIncompleteReply(err);
+                else callbacks?.onToolNotice?.(`⚠️ 回复生成失败: ${err instanceof Error ? err.message : String(err)}`);
                 break;
             }
             throw err;

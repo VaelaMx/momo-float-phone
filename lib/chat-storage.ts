@@ -114,6 +114,8 @@ export type ChatMessage = {
     order?: number; // Stable per-session display order
     responseBatchId?: string; // Assistant raw-response batch id
     rawResponseText?: string; // Assistant raw response before parsing/splitting
+    /** UI-only failed generation: kept for inspection, never used as a completed reply. */
+    generationFailure?: { partialContent: string; reason: string };
     responseRoundId?: string; // Group-chat whole-round id shared across all bubbles in one assistant turn
     toolExecutionId?: string; // Links visible tool attachments to their persisted tool result
     editableResponseText?: string; // Processed text shown in the reply editor

@@ -3,6 +3,8 @@
 import { forwardRef, Fragment, memo, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ChatSession, ChatMessage, CHAT_APP_SETTINGS_UPDATED_EVENT, CHAT_INITIAL_VISIBLE_MESSAGE_COUNT, CHAT_LOAD_MORE_MESSAGE_COUNT, CHAT_REQUEST_REPLY_EVENT, loadChatAppSettings, loadChatMessages, loadChatContacts, loadChatSessions, saveChatSessions, pushChatMessage, updateChatMessage, deleteChatMessage, deleteChatMessagesFrom, deleteChatMessagesByIds, retractChatMessage, editChatMessage, updateMessageMediaData, replaceResponseBatchWithParts, replaceGroupResponseRound, isReadingDiscussMessage, isSystemInstructionMessage, getSystemInstructionDisplayContent, createResponseBatchId, createResponseRoundId, getLatestStateValues, getLatestCharacterStateValues, compareChatMessages, isSessionStreamingEnabled, resolveChatBackgroundImage, resolveChatUserAvatar } from "@/lib/chat-storage";
 import { cleanStreamText, splitStreamPreviewSegments, stripLiteralTexts, stripXmlTagBlocks } from "@/lib/stream-preview";
+import { createIncompleteReplyNotice } from "@/lib/chat-generation-failure";
+import { IncompleteReplyNotice } from "./incomplete-reply-notice";
 import type { StateValue } from "@/lib/chat-storage";
 import { parseStateValues, mergeStateValues } from "@/lib/state-value-parser";
 import { parseAIResponse, type ParsedMessagePart } from "@/lib/rich-message-parser";
@@ -3282,6 +3284,26 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
         return null;
     };
 
+    const recordGenerationFailure = (error: unknown, prefix = "发送失败") => {
+        const incomplete = createIncompleteReplyNotice(error, {
+            stripXmlTags: streamPreviewTagConfig.online,
+            stripLiterals: streamPreviewTagConfig.stripTexts,
+        });
+        const errorMsg = pushChatMessage({
+            sessionId: session.id,
+            role: "system",
+            ...(incomplete ?? { content: `⚠️ ${prefix}: ${error instanceof Error ? error.message : String(error)}` }),
+        });
+        setMessages(prev => [...prev, errorMsg]);
+        if (incomplete) {
+            if (streamParseFrameRef.current) cancelAnimationFrame(streamParseFrameRef.current);
+            streamParseFrameRef.current = 0;
+            streamAccumRef.current = "";
+            setStreamPreview(null);
+            setPendingGenerate(true);
+        }
+    };
+
     const runManagedGeneration = async ({
         history,
         errorPrefix = "发送失败",
@@ -3300,6 +3322,12 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
         const isCurrentGeneration = () => isGenerationRunActive(session.id, generationRunId);
         const generationGuard: GenerationRunGuard = { signal: generationRun.controller.signal, isActive: isCurrentGeneration };
         let shouldRunDeclineReply = false;
+        let generationIncomplete = false;
+        const onIncompleteReply = (error: unknown) => {
+            if (!isCurrentGeneration()) return;
+            generationIncomplete = true;
+            recordGenerationFailure(error);
+        };
 
         isGeneratingRef.current = true;
         setIsGenerating(true);
@@ -3312,6 +3340,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                     session,
                     history,
                     {
+                        onIncompleteReply,
                         onReasoning: (t) => { roundReasoning = t; },
                         onStreamDelta: (delta) => {
                             if (!isCurrentGeneration()) return;
@@ -3359,6 +3388,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                         signal: generationRun.controller.signal,
                     },
                     {
+                        onIncompleteReply,
                         onReasoning: (t) => { capturedReasoning = t; },
                         onStreamDelta: (delta) => {
                             if (!isCurrentGeneration()) return;
@@ -3384,18 +3414,13 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                 if (!isCurrentGeneration()) return;
                 const result = await splitAndSaveAIMessages(flattenCompletionResult(cr), { ...generationGuard, reasoningText: capturedReasoning, instantReveal: isSessionStreamingEnabled(session, true) });
                 if (!isCurrentGeneration()) return;
-                scheduleFollowUp(session.id, 0, result.stateValues);
+                if (!generationIncomplete) scheduleFollowUp(session.id, 0, result.stateValues);
                 handleCallTrigger(result.triggerCall);
                 shouldRunDeclineReply = Boolean(result.hasDecline);
             }
         } catch (error: any) {
             if (!isCurrentGeneration() || isAbortLikeError(error)) return;
-            const errorMsg = pushChatMessage({
-                sessionId: session.id,
-                role: "system",
-                content: `⚠️ ${errorPrefix}: ${error?.message || String(error)}`,
-            });
-            setMessages(prev => [...prev, errorMsg]);
+            recordGenerationFailure(error, errorPrefix);
         } finally {
             if (finishGenerationRun(session.id, generationRunId)) {
                 isGeneratingRef.current = false;
@@ -3646,6 +3671,12 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
         const isCurrentGeneration = () => isGenerationRunActive(session.id, generationRunId);
         const generationGuard: GenerationRunGuard = { signal: generationRun.controller.signal, isActive: isCurrentGeneration };
         let shouldRunDeclineReply = false;
+        let generationIncomplete = false;
+        const onIncompleteReply = (error: unknown) => {
+            if (!isCurrentGeneration()) return;
+            generationIncomplete = true;
+            recordGenerationFailure(error);
+        };
         isGeneratingRef.current = true;
         setIsGenerating(true);
         setPendingGenerate(false);
@@ -3659,6 +3690,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                 // 每轮 LLM 调用的思维链：中间轮挂到该轮首条气泡，最终轮传给 processGroupParts
                 let pendingGroupReasoning: string | undefined;
                 const results = await generateGroupChatCompletion(session, latestMessages, {
+                    onIncompleteReply,
                     onReasoning: (t) => { pendingGroupReasoning = t; },
                     onStreamDelta: (delta) => {
                         if (!isCurrentGeneration()) return;
@@ -3835,6 +3867,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                     appTags: theaterMode ? ["chat"] : ["chat", "text"],
                     signal: generationRun.controller.signal,
                 }, {
+                    onIncompleteReply,
                     onReasoning: (t) => { pendingReasoning = t; },
                     onStreamDelta: (delta) => {
                         if (!isCurrentGeneration()) return;
@@ -3920,7 +3953,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                 if (!isCurrentGeneration()) return;
 
                 if (lastSendResult) {
-                    scheduleFollowUp(session.id, 0, lastSendResult.stateValues);
+                    if (!generationIncomplete) scheduleFollowUp(session.id, 0, lastSendResult.stateValues);
                     const isHidden = !mountedRef.current || !isChatRoomElementVisible(wrapperRef.current);
                     if (isHidden && lastSendResult.triggerCall) {
                         window.dispatchEvent(new CustomEvent("ai-call-trigger", {
@@ -3934,12 +3967,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
             }
         } catch (error: any) {
             if (!isCurrentGeneration() || isAbortLikeError(error)) return;
-            const errorMsg = pushChatMessage({
-                sessionId: session.id,
-                role: "system",
-                content: `⚠️ 发送失败: ${error?.message || String(error)}`
-            });
-            setMessages(prev => [...prev, errorMsg]);
+            recordGenerationFailure(error);
         } finally {
             if (finishGenerationRun(session.id, generationRunId)) {
                 isGeneratingRef.current = false;
@@ -6070,6 +6098,13 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                                                 msg={msg}
                                                 onApprove={handleApproveMemoryWrite}
                                                 onIgnore={handleIgnoreMemoryWrite}
+                                            />
+                                        ) : msg.generationFailure ? (
+                                            <IncompleteReplyNotice
+                                                message={msg.content}
+                                                partialContent={msg.generationFailure.partialContent}
+                                                busy={isGenerating}
+                                                onRetry={() => void triggerAIResponse()}
                                             />
                                         ) : blacklistEvent ? (
                                             <div className="chat-blacklist-event-content">
