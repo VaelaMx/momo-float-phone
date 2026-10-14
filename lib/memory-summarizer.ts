@@ -6,7 +6,7 @@ import type { MemoryEntry } from "./memory-types";
 import { DEFAULT_SUMMARIZATION_PROMPT } from "./memory-types";
 import {
     loadMemoryConfig,
-    loadMemoryEntries,
+    loadMemoryEntriesByType,
     saveMemoryEntry,
     deleteMemoryEntries,
     getEventCounter,
@@ -171,7 +171,8 @@ export async function runSummarizationPipeline(
     resetEventCounter(characterId);
 
     // Enforce long-term limit
-    const allLongTerm = await loadMemoryEntries(characterId);
+    // Core memories share the same store; never include them in long-term pruning.
+    const allLongTerm = await loadMemoryEntriesByType(characterId, "long_term");
     if (allLongTerm.length > config.maxLongTermEntries) {
         const excess = allLongTerm.slice(0, allLongTerm.length - config.maxLongTermEntries);
         await deleteMemoryEntries(excess.map(e => e.id));

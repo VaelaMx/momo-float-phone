@@ -69,9 +69,15 @@ export async function saveMemoryEntry(entry: MemoryEntry): Promise<void> {
     }
 }
 
-export async function loadMemoryEntries(characterId: string): Promise<MemoryEntry[]> {
+export async function loadMemoryEntries(
+    characterId: string,
+    options?: { requireAvailable?: boolean },
+): Promise<MemoryEntry[]> {
     const db = await openDb();
-    if (!db) return [];
+    if (!db) {
+        if (options?.requireAvailable) throw new Error("无法读取当前记忆库，请稍后重试，不能据此判断记忆缺失。");
+        return [];
+    }
     try {
         let entries: MemoryEntry[];
         try {
