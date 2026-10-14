@@ -910,7 +910,7 @@ async function restoreFromCloudManifestInternal(
     }
   }
   if (invalidMedia.size > 0) {
-    total.errors.push(`${invalidMedia.size} 个媒体对象缺失或损坏，部分图片/文件可能丢失`);
+    total.errors.push(`${invalidMedia.size} 个媒体对象缺失或损坏，涉及这些对象的记录未写入，请补齐备份后重试`);
   }
   onProgress({ percent: 100, detail: "完成" });
   return total;
