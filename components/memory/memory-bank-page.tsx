@@ -5,6 +5,7 @@ import { Trash2, Zap, Clock, Users, Archive, AlertCircle, Search, Brain, FileTex
 import { ConfirmDialog } from "@/components/ui/modal";
 import { getMemoryEventSourceTag, MEMORY_SOURCE_TAG_ORDER, MemoryTimeline } from "./memory-timeline";
 import { MemoryBackupCheck } from "./memory-backup-check";
+import { CharacterPreferencesPanel } from "./character-preferences-panel";
 import { Toggle } from "@/components/ui/form";
 import { loadCharacters } from "@/lib/character-storage";
 import type { Character } from "@/lib/character-types";
@@ -736,6 +737,7 @@ export function MemoryBankPage({
                         )
                     ) : activeTab === "core" ? (
                         <>
+                            <CharacterPreferencesPanel key={`preferences-${selectedChar.id}`} characterId={selectedChar.id} />
                             <MemoryBackupCheck key={selectedChar.id} characterId={selectedChar.id} />
                             {renderMemoryEntries("core", coreEntries, "暂无核心记忆。长期记忆累计到设定条数后会自动提炼，也可以手动新增。")}
                         </>

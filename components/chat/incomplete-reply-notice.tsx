@@ -11,8 +11,8 @@ export function IncompleteReplyNotice({ message, partialContent, busy, onRetry }
             <span>{message}</span>
             {partialContent && (
                 <details>
-                    <summary>查看已收到的文字（未作为正式回复保存）</summary>
-                    <textarea className="ui-textarea mt-1" aria-label="未完成的回复" readOnly value={partialContent} rows={5} />
+                    <summary>查看本次回复草稿（未作为正式回复保存）</summary>
+                    <textarea className="ui-textarea mt-1" aria-label="本次回复草稿" readOnly value={partialContent} rows={5} />
                 </details>
             )}
             <button

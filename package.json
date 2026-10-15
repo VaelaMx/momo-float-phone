@@ -13,6 +13,7 @@
     "check:push": "node scripts/check-personal-push-dist.mjs",
     "check:push-sync": "node scripts/check-push-outbox-delivery.cjs && node scripts/check-outbox-parser-safety.cjs",
     "check:safety": "node scripts/check-memory-stream-backup-safety.cjs",
+    "check:preferences": "node scripts/check-character-preferences.cjs",
     "weixin:assistant": "node tools/weixin-local-assistant/assistant.mjs",
     "weixin:assistant:once": "node tools/weixin-local-assistant/assistant.mjs --once",
     "weixin:build-dist": "node scripts/build-weixin-assistant-dist.mjs",

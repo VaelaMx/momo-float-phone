@@ -8,7 +8,9 @@ export function createIncompleteReplyNotice(
 ): Pick<ChatMessage, "content" | "mediaType" | "generationFailure"> | null {
     if (!(error instanceof IncompleteReplyError)) return null;
     return {
-        content: `⚠️ 回复未完成：${error.message}`,
+        content: error.reason === "preference_violation"
+            ? `⚠️ 称呼偏好检查：${error.message}`
+            : `⚠️ 回复未完成：${error.message}`,
         // Existing prompt/timeline filters exclude tool_notice, including its partial text.
         mediaType: "tool_notice",
         generationFailure: { partialContent: cleanStreamText(error.partialContent, options), reason: error.reason },

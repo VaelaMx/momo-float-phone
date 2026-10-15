@@ -1,5 +1,7 @@
 // lib/chat-engine.ts
 
+import { loadCharacterPreferences, formatCharacterPreferencesPrompt } from "./character-preferences";
+import { assertCharacterReplyPreferences, PreferenceViolationError } from "./character-preference-error";
 import { createSseJsonParser } from "./sse-json";
 import { createStreamCompletionTracker, finishReasonFailure, IncompleteReplyError } from "./llm-stream-completion";
 import { maybeAppendShortcutCapability } from "./offline-shortcut-capability";
@@ -1985,6 +1987,7 @@ export async function buildChatPromptMessages(
         scheduleSummary,
         currentSchedule,
         coreMemories,
+        currentUserPreferences: formatCharacterPreferencesPrompt(character.id, loadCharacterPreferences(character.id)),
         longTermMemories,
         worldBookActivationContext: options?.worldBookActivationContext || wbActivationContext,
         activateAllWorldBooks: options?.activateAllWorldBooks,
@@ -2316,6 +2319,7 @@ async function generateNativeChatCompletion(
         displayContent = stripPresetTexts(displayContent, preset);
 
         const { cleanText: afterActionStrip, actions } = parseActionTags(displayContent);
+        assertCharacterReplyPreferences(afterActionStrip, character.id);
         if (actions.length > 0) {
             throwIfAborted(options?.signal);
             dispatchActions(actions, actionContext).catch(err => console.warn("[ChatEngine] Action dispatch failed:", err));
@@ -2612,7 +2616,7 @@ export async function generateChatCompletion(
     try {
         return await generateChatCompletionCore(session, history, options, callbacks, bailoutRef);
     } catch (err) {
-        if (options?.signal?.aborted) bailoutRef.shortcutCancelled = true;
+        if (options?.signal?.aborted || err instanceof PreferenceViolationError) bailoutRef.shortcutCancelled = true;
         throw err;
     } finally {
         bailoutRef.closed = true;
@@ -2661,6 +2665,8 @@ async function generateChatCompletionCore(
         // 这条路径不挂续跑（见上），所以也不能向角色承诺第二轮
         maybeAppendShortcutCapability(bailoutMessages, { continuationAvailable: false });
         void import("./push-bailout-client").then(async mod => {
+            // A fast completion/validation failure may finish before the lazy import.
+            if (bailoutRef.closed || bailoutRef.shortcutCancelled) return;
             const handle = await mod.armReplyBailout({
                 sessionId: session.id,
                 characterName: character.name,
@@ -2673,7 +2679,7 @@ async function generateChatCompletionCore(
                 signal: options?.signal,
             });
             if (!handle) return;
-            if (bailoutRef.closed || bailoutRef.superseded) handle.settle();
+            if (bailoutRef.closed || bailoutRef.superseded || bailoutRef.shortcutCancelled) handle.settle();
             else bailoutRef.current = handle;
         }).catch(() => undefined);
     }
@@ -2762,6 +2768,7 @@ async function generateChatCompletionCore(
 
         // Parse actions (朋友圈 etc) — strip from display text but keep tool tags
         const { cleanText: afterActionStrip, actions } = parseActionTags(filteredOutput);
+        assertCharacterReplyPreferences(afterActionStrip, character.id);
         if (actions.length > 0) {
             throwIfAborted(options?.signal);
             dispatchActions(actions, actionContext).catch(err => console.warn("[ChatEngine] Action dispatch failed:", err));
@@ -2971,11 +2978,13 @@ async function generateChatCompletionCore(
                     }
                     // 剔除预设配置的文本片段（<思考结束> 等残留标签）
                     finalOutput = stripPresetTexts(finalOutput, preset);
+                    assertCharacterReplyPreferences(parseActionTags(finalOutput).cleanText, character.id);
                     await callbacks?.onTextPart?.(finalOutput);
                     parts.push({ text: finalOutput });
                     if (bailoutRef.shortcutHandles.length > 0) bailoutRef.shortcutCompleted = true;
                 } catch (err) {
                     throwIfAborted(options?.signal);
+                    if (err instanceof PreferenceViolationError) bailoutRef.shortcutCancelled = true;
                     const errMsg = `⚠️ 回复生成失败: ${err instanceof Error ? err.message : String(err)}`;
                     if (err instanceof IncompleteReplyError && callbacks?.onIncompleteReply) callbacks.onIncompleteReply(err);
                     else callbacks?.onToolNotice?.(errMsg);
