@@ -464,7 +464,7 @@ function generateZipBlob(zip: JSZip): Promise<Blob> {
   });
 }
 
-export async function readBackupBlob(blob: Blob): Promise<BackupEnvelope> {
+export async function readBackupBlob(blob: Blob, moduleIds?: DataModuleId[]): Promise<BackupEnvelope> {
   const zip = await JSZip.loadAsync(blob);
   const manifestFile = zip.file("manifest.json");
   if (!manifestFile) throw new Error("备份文件缺少 manifest.json");
@@ -474,12 +474,19 @@ export async function readBackupBlob(blob: Blob): Promise<BackupEnvelope> {
   const moduleFolder = zip.folder("modules");
   if (!moduleFolder) return { manifest, modules };
 
-  const fileNames = Object.keys(zip.files).filter((name) => name.startsWith("modules/") && name.endsWith(".json"));
+  const selected = moduleIds ? new Set(moduleIds) : null;
+  const fileNames = Object.keys(zip.files).filter((name) => {
+    if (!name.startsWith("modules/") || !name.endsWith(".json")) return false;
+    // Current source-level ZIPs and legacy flat module ZIPs are both supported.
+    const moduleId = name.slice("modules/".length).split("/")[0].replace(/\.json$/, "");
+    return !selected || selected.has(moduleId as DataModuleId);
+  });
   for (const fileName of fileNames) {
     const file = zip.file(fileName);
     if (!file) continue;
     const payload = JSON.parse(await file.async("string")) as unknown;
     if (!isModulePayload(payload)) throw new Error(`${fileName}: 数据结构损坏`);
+    if (selected && !selected.has(payload.moduleId)) continue;
     modules.push(payload);
   }
 
@@ -553,7 +560,7 @@ export async function importBackupBlob(blob: Blob, moduleIds?: DataModuleId[], o
   }
 
   if (invalidMedia.size > 0) {
-    total.errors.push(`${invalidMedia.size} 个媒体对象缺失或损坏，部分图片/文件可能丢失`);
+    total.errors.push(`${invalidMedia.size} 个媒体对象缺失或损坏，涉及这些对象的记录未写入，请补齐备份后重试`);
   }
 
   return total;

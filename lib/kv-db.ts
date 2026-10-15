@@ -217,6 +217,15 @@ export async function kvSetAsync(key: string, value: string): Promise<void> {
     }
 }
 
+/** Explicit-save settings publish only after the durable write succeeds.
+ * Unlike the legacy optimistic setters, a rejected write leaves the current
+ * cache and fallback untouched. Callers should serialize edits to a key. */
+export async function kvSetConfirmedAsync(key: string, value: string): Promise<void> {
+    await kvDb.entries.put({ key, value });
+    _cache.set(key, value);
+    if (isManagedLegacyKey(key)) removeLegacyLocalStorageKey(key);
+}
+
 // ── Delete ──
 export function kvRemove(key: string): void {
     _cache.delete(key);

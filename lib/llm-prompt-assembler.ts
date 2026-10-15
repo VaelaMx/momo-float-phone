@@ -41,6 +41,25 @@ export type LLMMessage = {
     };
 };
 
+/** Keep the preference reminder late in the request without consuming an assistant prefill
+ * or splitting a native assistant/tool exchange. This block bypasses input regexes and
+ * preset slot selection intentionally: it is an explicit, separately enabled user setting. */
+export function injectCurrentUserPreferences(messages: LLMMessage[], prompt?: string): void {
+    if (!prompt?.trim()) return;
+    let insertAt = messages.length;
+    while (insertAt > 0) {
+        const previous = messages[insertAt - 1];
+        if (previous.role !== "assistant" || previous._debugMeta?._fromHistory
+            || previous.toolCalls?.length || previous.toolCallId) break;
+        insertAt -= 1;
+    }
+    messages.splice(insertAt, 0, {
+        role: "system",
+        content: prompt.trim(),
+        _debugMeta: { marker: "currentUserPreferences" },
+    });
+}
+
 export interface AssemblerInput {
     character: Character;
     history: ChatMessage[];
@@ -64,6 +83,8 @@ export interface AssemblerInput {
     currentSchedule?: string;
     longTermMemories?: string;
     coreMemories?: string;
+    /** Explicit current preferences, injected independently of preset memory slots. */
+    currentUserPreferences?: string;
     worldBookActivationContext?: string;  // override history-based keyword activation context
     activateAllWorldBooks?: boolean;      // true = skip keyword matching, activate all non-disabled entries
     recentBlocks?: RecentBlock[];          // per-feature recent data blocks; last block wraps history
@@ -608,7 +629,7 @@ function isWBAtDepthPosition(entry: WorldBookEntry): boolean {
  * Core Engine: Assembles the final LLM payload array using Depth and Order injection rules.
  * 完全由预设驱动：宏展开、prompt_order（缺失时按 prompts 数组顺序）、
  * RELATIVE/ABSOLUTE injection_position 分类、标记条目定位。
- * 预设里没有的东西一律不注入——不存在人设/世界书/记忆的硬编码兜底。
+ * 人设/世界书/记忆没有硬编码兜底；用户显式启用的固定偏好独立注入，不依赖预设槽位。
  */
 export function assemblePromptPayload(input: AssemblerInput): LLMMessage[] {
     const { character, history, preset, worldBooks, regexes, userIdentity, userName = "User",
@@ -1115,6 +1136,8 @@ export function assemblePromptPayload(input: AssemblerInput): LLMMessage[] {
         }
     });
 
+    injectCurrentUserPreferences(finalPayload, input.currentUserPreferences);
+
     // --- Post-process: merge any remaining consecutive same-role messages ---
     // This catches cases where preset entries (non-history) end up adjacent to
     // history messages with the same role, which can cause API errors.
@@ -1122,6 +1145,8 @@ export function assemblePromptPayload(input: AssemblerInput): LLMMessage[] {
         const cur = finalPayload[i];
         const prev = finalPayload[i - 1];
         const canMerge = cur.role === prev.role
+            && cur._debugMeta?.marker !== "currentUserPreferences"
+            && prev._debugMeta?.marker !== "currentUserPreferences"
             && cur.role !== "tool"
             && !cur.toolCalls?.length
             && !prev.toolCalls?.length
@@ -1603,6 +1628,7 @@ export interface GroupAssemblerInput {
     appTags?: string[];
     userIdentity?: UserIdentity | null;
     userName?: string;
+    currentUserPreferences?: string;
     groupName?: string;
     memberNames?: string;
     worldBookActivationContext?: string;
@@ -2277,11 +2303,15 @@ export function assembleGroupPromptPayload(input: GroupAssemblerInput): LLMMessa
         }
     });
 
+    injectCurrentUserPreferences(finalPayload, input.currentUserPreferences);
+
     // --- Post-process: merge any remaining consecutive same-role messages ---
     for (let i = finalPayload.length - 1; i > 0; i--) {
         const cur = finalPayload[i];
         const prev = finalPayload[i - 1];
         const canMerge = cur.role === prev.role
+            && cur._debugMeta?.marker !== "currentUserPreferences"
+            && prev._debugMeta?.marker !== "currentUserPreferences"
             && cur.role !== "tool"
             && !cur.toolCalls?.length
             && !prev.toolCalls?.length

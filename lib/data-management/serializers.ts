@@ -22,6 +22,13 @@ export type MediaCollector = { add(blob: Blob): Promise<string> };
  * media out of the JS heap; Uint8Array remains accepted for older callers. */
 export type MediaResolver = (ref: string) => Promise<Blob | Uint8Array | null>;
 
+export class MissingBackupMediaError extends Error {
+  constructor(ref: string) {
+    super(`备份媒体缺失或校验失败：${ref}；已跳过该记录，未覆盖现有数据`);
+    this.name = "MissingBackupMediaError";
+  }
+}
+
 // Only extract sizeable base64 data-URLs; tiny strings stay inline (not worth a separate object).
 const MEDIA_DATAURL_RE = /^data:([^;,]*);base64,/i;
 const MEDIA_MIN_LENGTH = 2048;
@@ -152,8 +159,9 @@ export async function deserializeValue(value: unknown, resolver?: MediaResolver)
     const encoding = value.encoding === "dataurl" ? "dataurl" : "blob";
     const resolved = resolver ? await resolver(ref) : null;
     if (!resolved) {
-      // Media object missing → return an empty placeholder so the rest of the record still restores.
-      return encoding === "dataurl" ? "" : new Blob([], { type: mimeType });
+      // importSource catches this per record, before opening its write transaction.
+      // Empty placeholders would destroy healthy media during overwrite/merge restore.
+      throw new MissingBackupMediaError(ref);
     }
     if (encoding === "blob") {
       return resolved instanceof Blob
@@ -216,12 +224,10 @@ export async function serializeStorageString(value: string, collector?: MediaCol
  * are returned byte-for-byte so ordinary settings JSON is never reformatted. */
 export async function deserializeStorageString(value: string, resolver?: MediaResolver): Promise<string> {
   if (!resolver || !/"__aiPhoneMediaRef"\s*:/.test(value)) return value;
-  try {
-    const restored = await deserializeValue(JSON.parse(value), resolver);
-    return typeof restored === "string" ? restored : JSON.stringify(restored);
-  } catch {
-    return value;
-  }
+  // Propagate failures: returning the serialized marker would still overwrite a
+  // valid local record with an unusable media reference.
+  const restored = await deserializeValue(JSON.parse(value), resolver);
+  return typeof restored === "string" ? restored : JSON.stringify(restored);
 }
 
 // 纯算术估算 UTF-8 字节数：逐字符累加，零内存分配。

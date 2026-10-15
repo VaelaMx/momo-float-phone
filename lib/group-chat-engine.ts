@@ -1,6 +1,8 @@
 // lib/group-chat-engine.ts
 // Group chat engine: single API call for all characters.
 
+import { loadCharacterPreferences, formatCharacterPreferencesPrompt } from "./character-preferences";
+import { assertCharacterReplyPreferences } from "./character-preference-error";
 import { ChatSession, ChatMessage, loadChatAppSettings, createResponseBatchId, createResponseRoundId, createToolExecutionId, loadChatSessions, getLatestCharacterStateValues, isSessionStreamingEnabled, resolveVisionImagePromptLimit } from "./chat-storage";
 import { extractTextToolDirectiveText } from "./text-tool-protocol";
 import type { ApiConfig, PresetConfig, RegexConfig } from "./settings-types";
@@ -39,6 +41,7 @@ import {
     type NativeChatToolBundle,
 } from "./chat-engine";
 import type { CustomAppPromptProfile } from "./custom-app-types";
+import { IncompleteReplyError } from "./llm-stream-completion";
 import { isNeteaseConfigured } from "./music-service";
 import { buildCalendarScheduleMarker, getCurrentCalendarScheduleForPrompt } from "./calendar-storage";
 import { getWeekStartIso } from "./calendar-utils";
@@ -203,6 +206,14 @@ export function parseGroupChatResponse(
     }
 
     return results;
+}
+
+/** Validate the complete round before saving any member's prose or executing tools.
+ * Per-member parsing keeps one character's address rules from affecting other speakers. */
+export function assertGroupReplyPreferences(text: string, nameToId: Map<string, string>): void {
+    for (const result of parseGroupChatResponse(text, nameToId)) {
+        assertCharacterReplyPreferences(parseActionTags(result.responseText).cleanText, result.characterId);
+    }
 }
 
 function stripToolTags(text: string): string {
@@ -467,6 +478,10 @@ async function buildGroupChatPromptMessages(
         userName,
         groupName: session.groupName,
         memberNames: memberNames.join("、"),
+        currentUserPreferences: members.map(member => {
+            const prompt = formatCharacterPreferencesPrompt(member.character.id, loadCharacterPreferences(member.character.id));
+            return prompt ? `以下偏好仅适用于角色 ${JSON.stringify(member.character.name)}：\n${prompt}` : "";
+        }).filter(Boolean).join("\n\n"),
         worldBookActivationContext: wbActivationContext,
         unifiedRecentItems,
         customStickerNames: allStickerNames,
@@ -614,7 +629,8 @@ async function runNativeGroupToolLoop(params: {
         } catch (err) {
             if (finalRawOutput) {
                 throwIfAborted(signal);
-                callbacks?.onToolNotice?.(`⚠️ 回复生成失败: ${err instanceof Error ? err.message : String(err)}`);
+                if (err instanceof IncompleteReplyError && callbacks?.onIncompleteReply) callbacks.onIncompleteReply(err);
+                else callbacks?.onToolNotice?.(`⚠️ 回复生成失败: ${err instanceof Error ? err.message : String(err)}`);
                 break;
             }
             throw err;
@@ -630,6 +646,7 @@ async function runNativeGroupToolLoop(params: {
         }
         // 剔除预设配置的文本片段（<思考结束> 等残留标签）
         displayContent = stripPresetTexts(displayContent, preset);
+        assertGroupReplyPreferences(displayContent, nameToId);
         const assistantForToolContext = stripStateAndInnerForPrompt(displayContent);
         if (result.toolCalls.length === 0) {
             throwIfAborted(signal);
@@ -869,7 +886,8 @@ export async function generateGroupChatCompletion(
         } catch (err) {
             if (finalRawOutput) {
                 throwIfAborted(options?.signal);
-                callbacks?.onToolNotice?.(`⚠️ 回复生成失败: ${err instanceof Error ? err.message : String(err)}`);
+                if (err instanceof IncompleteReplyError && callbacks?.onIncompleteReply) callbacks.onIncompleteReply(err);
+                else callbacks?.onToolNotice?.(`⚠️ 回复生成失败: ${err instanceof Error ? err.message : String(err)}`);
                 break;
             }
             throw err;
@@ -884,6 +902,7 @@ export async function generateGroupChatCompletion(
         }
         // 剔除预设配置的文本片段（<思考结束> 等残留标签），不进入消息/提示词
         filteredOutput = stripPresetTexts(filteredOutput, preset);
+        assertGroupReplyPreferences(filteredOutput, nameToId);
 
         const toolFetches = parseToolFetches(filteredOutput);
         const { toolCalls } = parseToolCalls(filteredOutput);
@@ -1061,6 +1080,7 @@ export async function generateGroupChatCompletion(
 
     // Parse final output into per-character results
     throwIfAborted(options?.signal);
+    assertGroupReplyPreferences(finalRawOutput, nameToId);
     const parsed = parseGroupChatResponse(finalRawOutput, nameToId);
 
     const finalResults: typeof parsed = [];

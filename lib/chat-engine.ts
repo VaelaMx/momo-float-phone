@@ -1,6 +1,9 @@
 // lib/chat-engine.ts
 
+import { loadCharacterPreferences, formatCharacterPreferencesPrompt } from "./character-preferences";
+import { assertCharacterReplyPreferences, PreferenceViolationError } from "./character-preference-error";
 import { createSseJsonParser } from "./sse-json";
+import { createStreamCompletionTracker, finishReasonFailure, IncompleteReplyError } from "./llm-stream-completion";
 import { maybeAppendShortcutCapability } from "./offline-shortcut-capability";
 import { loadCharacters } from "./character-storage";
 import { buildScreenEffectPromptHint } from "./chat-screen-effects";
@@ -749,7 +752,9 @@ async function readSseStream(
 
     // 容错解析：中转把长 JSON 行切开时做碎片重组，不再静默丢增量（见 sse-json.ts）
     const sseParser = createSseJsonParser();
+    const completion = createStreamCompletionTracker(providerKind);
     const handleParsed = async (parsed: unknown) => {
+        completion.observeValue(parsed);
         const parts = parseProviderStreamDelta(providerKind, parsed);
         if (parts.reasoning) {
             await callbacks?.onReasoningDelta?.(parts.reasoning);
@@ -763,6 +768,7 @@ async function readSseStream(
         }
     };
     const handleEvent = async (eventText: string) => {
+        completion.observeEvent(eventText);
         // 原始流只为调试快照保留头部：长输出整条累积会把低内存设备的 WebView 顶爆
         if (rawResponse.length < 65_536) rawResponse += `${eventText}\n`;
         for (const parsed of sseParser.pushEvent(eventText)) {
@@ -770,15 +776,22 @@ async function readSseStream(
         }
     };
 
-    while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const parsed = parseSseEvents(buffer);
-        buffer = parsed.rest;
-        for (const eventText of parsed.events) {
-            await handleEvent(eventText);
+    let readError: unknown;
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const parsed = parseSseEvents(buffer);
+            buffer = parsed.rest;
+            for (const eventText of parsed.events) {
+                await handleEvent(eventText);
+            }
         }
+    } catch (error) {
+        readError = error;
+    } finally {
+        reader.releaseLock();
     }
     buffer += decoder.decode();
     if (buffer.trim()) {
@@ -792,6 +805,11 @@ async function readSseStream(
         content += finalContent;
         await callbacks?.onDelta?.(finalContent);
     }
+    if (readError) {
+        throw new IncompleteReplyError("连接在生成过程中中断，回复未完成。可重新生成。", content, "network", { cause: readError });
+    }
+    const failure = completion.failure();
+    if (failure) throw new IncompleteReplyError(failure, content, "completion");
     return { content, rawResponse };
 }
 
@@ -884,6 +902,10 @@ export async function sendLLMStreamRequest(
         }
         return { content: rawOutput, rawResponse, providerKind: request.providerKind };
     } catch (error: unknown) {
+        if (error instanceof IncompleteReplyError) {
+            throwIfAborted(options?.signal);
+            throw error;
+        }
         if (error instanceof DOMException && (error as DOMException).name === "AbortError") {
             if (options?.signal?.aborted) throw error;
             throw new ChatEngineError("AI 流式回复超时（500秒），请重试。");
@@ -1009,6 +1031,9 @@ export async function sendLLMRequest(
             reasoning: parsed.reasoning || undefined,
         });
 
+        const completionFailure = finishReasonFailure(extractFinishReason(data));
+        if (completionFailure) throw new IncompleteReplyError(completionFailure, rawOutput, "completion");
+
         if (options?.skipOutputRegex) {
             return rawOutput;
         }
@@ -1026,7 +1051,7 @@ export async function sendLLMRequest(
         if (error instanceof DOMException && (error as DOMException).name === "AbortError") {
             throw new ChatEngineError("AI 回复超时（500秒），请重试。");
         }
-        if (error instanceof ChatEngineError) throw error;
+        if (error instanceof ChatEngineError || error instanceof IncompleteReplyError) throw error;
         const detail = error instanceof Error ? error.message : String(error);
         throw new ChatEngineError(
             `Network Error connecting to AI Provider: ${detail}\n请求诊断：provider=${requestDebugInfo.provider}, model=${requestDebugInfo.model}, app=${requestDebugInfo.appId}, messages=${requestDebugInfo.messageCount}, bodySize=${requestDebugInfo.bodySize}, estimatedTokens=${requestDebugInfo.bodyTokenEstimate}, largestMessage=${requestDebugInfo.largestMessageSize}, largestRole=${requestDebugInfo.largestMessageRole}, largestIndex=${requestDebugInfo.largestMessageIndex}`,
@@ -1132,6 +1157,7 @@ export async function sendLLMToolStreamRequest(
     const contentStripper = createStreamingTimestampStripper();
     const toolDrafts = new Map<number, StreamToolCallDraft>();
     const firedToolCallStarts = new Set<number>();
+    let releaseStreamReader: (() => void) | undefined;
 
     try {
         const response = await fetchLlmPayload(request, { signal: llmAbort.signal });
@@ -1143,12 +1169,15 @@ export async function sendLLMToolStreamRequest(
         if (!response.body) throw new ChatEngineError("原生动作流式响应没有 body。");
 
         const reader = response.body.getReader();
+        releaseStreamReader = () => reader.releaseLock();
         const decoder = new TextDecoder();
         let buffer = "";
         // 容错解析：中转把超长工具参数 JSON 行切开时做碎片重组，
         // 不再因单行 JSON Parse error 杀掉整条流（写 APP 大参数时高发）
         const sseParser = createSseJsonParser();
+        const completion = createStreamCompletionTracker(request.providerKind);
         const handleParsedDelta = async (data: unknown) => {
+            completion.observeValue(data);
             {
                     const delta = parseProviderStreamDelta(request.providerKind, data);
                     if (delta.reasoning) {
@@ -1190,6 +1219,7 @@ export async function sendLLMToolStreamRequest(
             const parsed = parseSseEvents(buffer);
             buffer = parsed.rest;
             for (const event of parsed.events) {
+                completion.observeEvent(event);
                 if (rawResponse.length < 65_536) rawResponse += `${event}\n`;
                 for (const data of sseParser.pushEvent(event)) {
                     await handleParsedDelta(data);
@@ -1197,7 +1227,9 @@ export async function sendLLMToolStreamRequest(
             }
         }
 
+        buffer += decoder.decode();
         if (buffer.trim()) {
+            completion.observeEvent(buffer);
             if (rawResponse.length < 65_536) rawResponse += buffer.trim();
             for (const data of sseParser.pushEvent(buffer)) {
                 await handleParsedDelta(data);
@@ -1211,6 +1243,8 @@ export async function sendLLMToolStreamRequest(
             content += finalContent;
             await callbacks?.onDelta?.(finalContent);
         }
+        const completionFailure = completion.failure();
+        if (completionFailure) throw new IncompleteReplyError(completionFailure, content, "completion");
         content = await applyChatPluginLlmResponse(content, pluginPurpose, options?.debugSessionId);
 
         const sanitizedMessages = request.messagesForLog.map(m => ({
@@ -1242,6 +1276,17 @@ export async function sendLLMToolStreamRequest(
             providerKind: request.providerKind,
         };
     } catch (error: unknown) {
+        if (error instanceof IncompleteReplyError) {
+            throwIfAborted(options?.signal);
+            throw error;
+        }
+        // Preserve the withheld tail too; incomplete tool parameters are never executed.
+        if (!options?.signal?.aborted) {
+            const tail = contentStripper.flush();
+            content += tail;
+            if (tail) await callbacks?.onDelta?.(tail);
+            if (content) throw new IncompleteReplyError("连接在生成过程中中断，回复未完成。可重新生成。", content, "network", { cause: error });
+        }
         if (error instanceof DOMException && error.name === "AbortError") {
             if (options?.signal?.aborted) throw error;
             throw new ChatEngineError("AI 原生动作流式回复超时（500秒），请重试。");
@@ -1250,6 +1295,7 @@ export async function sendLLMToolStreamRequest(
         const detail = error instanceof Error ? error.message : String(error);
         throw new ChatEngineError(`Tool Stream Network Error connecting to AI Provider: ${detail}`);
     } finally {
+        releaseStreamReader?.();
         clearTimeout(llmTimeout);
         detachExternalAbort();
     }
@@ -1330,6 +1376,9 @@ export async function sendLLMToolRequest(
             usage: parsed.usage,
         });
 
+        const completionFailure = finishReasonFailure(extractFinishReason(data));
+        if (completionFailure) throw new IncompleteReplyError(completionFailure, rawOutput, "completion");
+
         if (!options?.skipOutputRegex && rawOutput) {
             const macroEngine = new MacroEngine(meta?.characterName ?? "", meta?.userName ?? "用户");
             const activeTags = getActiveAppTags(options?.appId ?? "chat", {
@@ -1356,7 +1405,7 @@ export async function sendLLMToolRequest(
             if (options?.signal?.aborted) throw error;
             throw new ChatEngineError("AI 原生动作回复超时（500秒），请重试。");
         }
-        if (error instanceof ChatEngineError) throw error;
+        if (error instanceof ChatEngineError || error instanceof IncompleteReplyError) throw error;
         const detail = error instanceof Error ? error.message : String(error);
         throw new ChatEngineError(`Tool Network Error connecting to AI Provider: ${detail}`);
     } finally {
@@ -1938,6 +1987,7 @@ export async function buildChatPromptMessages(
         scheduleSummary,
         currentSchedule,
         coreMemories,
+        currentUserPreferences: formatCharacterPreferencesPrompt(character.id, loadCharacterPreferences(character.id)),
         longTermMemories,
         worldBookActivationContext: options?.worldBookActivationContext || wbActivationContext,
         activateAllWorldBooks: options?.activateAllWorldBooks,
@@ -2021,6 +2071,7 @@ export async function buildChatPromptMessages(
 }
 
 export type ChatCompletionCallbacks = {
+    onIncompleteReply?: (error: IncompleteReplyError) => void;
     onTextPart?: (text: string, senderInfo?: {
         characterId: string;
         characterName: string;
@@ -2248,7 +2299,8 @@ async function generateNativeChatCompletion(
             const errMsg = `⚠️ 回复生成失败: ${err instanceof Error ? err.message : String(err)}`;
             if (parts.length > 0) {
                 throwIfAborted(options?.signal);
-                callbacks?.onToolNotice?.(errMsg);
+                if (err instanceof IncompleteReplyError && callbacks?.onIncompleteReply) callbacks.onIncompleteReply(err);
+                else callbacks?.onToolNotice?.(errMsg);
                 parts.push({ text: "", toolNotice: errMsg });
                 break;
             }
@@ -2267,6 +2319,7 @@ async function generateNativeChatCompletion(
         displayContent = stripPresetTexts(displayContent, preset);
 
         const { cleanText: afterActionStrip, actions } = parseActionTags(displayContent);
+        assertCharacterReplyPreferences(afterActionStrip, character.id);
         if (actions.length > 0) {
             throwIfAborted(options?.signal);
             dispatchActions(actions, actionContext).catch(err => console.warn("[ChatEngine] Action dispatch failed:", err));
@@ -2563,7 +2616,7 @@ export async function generateChatCompletion(
     try {
         return await generateChatCompletionCore(session, history, options, callbacks, bailoutRef);
     } catch (err) {
-        if (options?.signal?.aborted) bailoutRef.shortcutCancelled = true;
+        if (options?.signal?.aborted || err instanceof PreferenceViolationError) bailoutRef.shortcutCancelled = true;
         throw err;
     } finally {
         bailoutRef.closed = true;
@@ -2612,6 +2665,8 @@ async function generateChatCompletionCore(
         // 这条路径不挂续跑（见上），所以也不能向角色承诺第二轮
         maybeAppendShortcutCapability(bailoutMessages, { continuationAvailable: false });
         void import("./push-bailout-client").then(async mod => {
+            // A fast completion/validation failure may finish before the lazy import.
+            if (bailoutRef.closed || bailoutRef.shortcutCancelled) return;
             const handle = await mod.armReplyBailout({
                 sessionId: session.id,
                 characterName: character.name,
@@ -2624,7 +2679,7 @@ async function generateChatCompletionCore(
                 signal: options?.signal,
             });
             if (!handle) return;
-            if (bailoutRef.closed || bailoutRef.superseded) handle.settle();
+            if (bailoutRef.closed || bailoutRef.superseded || bailoutRef.shortcutCancelled) handle.settle();
             else bailoutRef.current = handle;
         }).catch(() => undefined);
     }
@@ -2690,7 +2745,8 @@ async function generateChatCompletionCore(
             const errMsg = `⚠️ 回复生成失败: ${err instanceof Error ? err.message : String(err)}`;
             if (parts.length > 0) {
                 throwIfAborted(options?.signal);
-                callbacks?.onToolNotice?.(errMsg);
+                if (err instanceof IncompleteReplyError && callbacks?.onIncompleteReply) callbacks.onIncompleteReply(err);
+                else callbacks?.onToolNotice?.(errMsg);
                 parts.push({ text: "", toolNotice: errMsg });
                 break;
             }
@@ -2712,6 +2768,7 @@ async function generateChatCompletionCore(
 
         // Parse actions (朋友圈 etc) — strip from display text but keep tool tags
         const { cleanText: afterActionStrip, actions } = parseActionTags(filteredOutput);
+        assertCharacterReplyPreferences(afterActionStrip, character.id);
         if (actions.length > 0) {
             throwIfAborted(options?.signal);
             dispatchActions(actions, actionContext).catch(err => console.warn("[ChatEngine] Action dispatch failed:", err));
@@ -2921,13 +2978,16 @@ async function generateChatCompletionCore(
                     }
                     // 剔除预设配置的文本片段（<思考结束> 等残留标签）
                     finalOutput = stripPresetTexts(finalOutput, preset);
+                    assertCharacterReplyPreferences(parseActionTags(finalOutput).cleanText, character.id);
                     await callbacks?.onTextPart?.(finalOutput);
                     parts.push({ text: finalOutput });
                     if (bailoutRef.shortcutHandles.length > 0) bailoutRef.shortcutCompleted = true;
                 } catch (err) {
                     throwIfAborted(options?.signal);
+                    if (err instanceof PreferenceViolationError) bailoutRef.shortcutCancelled = true;
                     const errMsg = `⚠️ 回复生成失败: ${err instanceof Error ? err.message : String(err)}`;
-                    callbacks?.onToolNotice?.(errMsg);
+                    if (err instanceof IncompleteReplyError && callbacks?.onIncompleteReply) callbacks.onIncompleteReply(err);
+                    else callbacks?.onToolNotice?.(errMsg);
                     parts.push({ text: "", toolNotice: errMsg });
                 }
             }

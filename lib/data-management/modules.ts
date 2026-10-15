@@ -62,6 +62,7 @@ const PRIMARY_DATA_MODULES: DataModuleDefinition[] = [
           "chat-generating:",
           "pending_reply_",
           "ai_phone_chat_offline_turns:",
+          "ai_phone_push_outbox_journal_v1:",
           "chat-offline-mode:",
           "chat-theater-mode:",
           "chat_plugin_data_v1:",
@@ -175,7 +176,7 @@ const PRIMARY_DATA_MODULES: DataModuleDefinition[] = [
   {
     id: "memory",
     label: "记忆",
-    description: "长期记忆、核心记忆、事件计数与摘要时间戳",
+    description: "长期记忆、核心记忆、角色固定偏好、事件计数与摘要时间戳",
     variant: "warning",
     critical: true,
     sources: [
@@ -185,6 +186,7 @@ const PRIMARY_DATA_MODULES: DataModuleDefinition[] = [
         label: "记忆配置与计数",
         keys: ["ai_phone_memory_config_v1"],
         prefixes: [
+          "ai_phone_character_preferences_v1:",
           "ai_phone_mem_evt_count_",
           "ai_phone_mem_last_sum_",
           "ai_phone_mem_core_count_",

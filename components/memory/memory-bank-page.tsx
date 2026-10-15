@@ -4,6 +4,8 @@ import { Component, useState, useEffect, useCallback, useMemo, type CSSPropertie
 import { Trash2, Zap, Clock, Users, Archive, AlertCircle, Search, Brain, FileText, MoreHorizontal, Plus, Edit3, X, Check, ChevronRight, Filter, type LucideIcon } from "lucide-react";
 import { ConfirmDialog } from "@/components/ui/modal";
 import { getMemoryEventSourceTag, MEMORY_SOURCE_TAG_ORDER, MemoryTimeline } from "./memory-timeline";
+import { MemoryBackupCheck } from "./memory-backup-check";
+import { CharacterPreferencesPanel } from "./character-preferences-panel";
 import { Toggle } from "@/components/ui/form";
 import { loadCharacters } from "@/lib/character-storage";
 import type { Character } from "@/lib/character-types";
@@ -734,7 +736,11 @@ export function MemoryBankPage({
                             />
                         )
                     ) : activeTab === "core" ? (
-                        renderMemoryEntries("core", coreEntries, "暂无核心记忆。长期记忆累计到设定条数后会自动提炼，也可以手动新增。")
+                        <>
+                            <CharacterPreferencesPanel key={`preferences-${selectedChar.id}`} characterId={selectedChar.id} />
+                            <MemoryBackupCheck key={selectedChar.id} characterId={selectedChar.id} />
+                            {renderMemoryEntries("core", coreEntries, "暂无核心记忆。长期记忆累计到设定条数后会自动提炼，也可以手动新增。")}
+                        </>
                     ) : (
                         /* ── Long-term: Summarized Memories ── */
                         renderMemoryEntries("long_term", longTermEntries, "暂无长期记忆。点击设置页的手动总结，或直接新增一条记忆。")
