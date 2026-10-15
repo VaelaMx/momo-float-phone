@@ -16,11 +16,13 @@ import {
     updateMessageMediaData,
     createResponseBatchId,
     getLatestCharacterStateValues,
+    upsertImportedChatMessage,
 } from "./chat-storage";
 import type { ChatMessage, StateValue } from "./chat-storage";
 import { generateChatCompletion, flattenCompletionResult } from "./chat-engine";
 import { armFollowUpBailout, armIdleReconnectBailout, cancelBailoutKey, cancelBailoutPrefix, cancelFollowUpBailout, startBailoutHeartbeat } from "./push-bailout-client";
 import { isWithinPushQuietHours } from "./push-client";
+import { isPersonalPushCloudActive } from "./personal-push-cloud";
 import {
     IDLE_RECONNECT_MAX_CONSECUTIVE,
     loadIdleReconnectRules,
@@ -115,9 +117,13 @@ let scheduledOutboxGraceUntil = 0;
 let scheduledOutboxVisibilityHandler: (() => void) | null = null;
 let scheduledOutboxFocusHandler: (() => void) | null = null;
 let scheduledOutboxPageShowHandler: (() => void) | null = null;
+let automaticPollInFlight: Promise<void> | null = null;
+let scheduledOutboxSyncVersion = 0;
+let scheduledOutboxSyncedVersion = -1;
 
 function extendScheduledOutboxGrace(): void {
     scheduledOutboxGraceUntil = Math.max(scheduledOutboxGraceUntil, Date.now() + SCHEDULED_OUTBOX_GRACE_MS);
+    scheduledOutboxSyncVersion += 1;
 }
 
 // ── Public API ─────────────────────────────────────────────
@@ -130,7 +136,7 @@ export function startFollowUpService() {
     if (typeof window !== "undefined") {
         periodCareUpdateHandler = () => {
             lastPeriodCarePollAt = 0;
-            pollMenstrualPeriodCare(Date.now());
+            void pollSchedules();
         };
         window.addEventListener("menstrual-period-care-updated", periodCareUpdateHandler);
         scheduledOutboxVisibilityHandler = () => {
@@ -350,8 +356,41 @@ async function saveBackgroundCompletionRounds(
     return { hasVisible, newCount, stateValues };
 }
 
-function pollSchedules() {
+async function pollSchedules(): Promise<void> {
+    if (automaticPollInFlight) return automaticPollInFlight;
+    automaticPollInFlight = pollSchedulesAfterOutbox();
     try {
+        await automaticPollInFlight;
+    } finally {
+        automaticPollInFlight = null;
+    }
+}
+
+async function pollSchedulesAfterOutbox(): Promise<void> {
+    try {
+        if (isPersonalPushCloudActive()) {
+            const syncVersion = scheduledOutboxSyncVersion;
+            const beforeSyncAt = Date.now();
+            // A throttled success from minutes ago is insufficient before
+            // executing overdue work. These snapshots decide freshness only;
+            // every actual task is read again after the awaited merge.
+            const dueWork = loadAllFollowUpSchedules().some(schedule => schedule.fireAt <= beforeSyncAt)
+                || loadTimedWakeSchedules().some(schedule => schedule.fireAt <= beforeSyncAt)
+                || (beforeSyncAt - lastPeriodCarePollAt >= PERIOD_CARE_POLL_INTERVAL_MS && loadMenstrualConfig().periodCareEnabled)
+                || (beforeSyncAt - lastIdleReconnectPollAt >= IDLE_RECONNECT_POLL_INTERVAL_MS && loadIdleReconnectRules().length > 0);
+            const { consumeServerOutbox } = await import("./push-outbox-client");
+            const result = await consumeServerOutbox({ force: dueWork || syncVersion !== scheduledOutboxSyncedVersion });
+            if (!result.ok) {
+                // A failed/unfinished pull cannot establish that a due task is
+                // still ours. Retry on the normal poll; direct user replies are
+                // independent of this automatic scheduling barrier.
+                scheduledOutboxSyncedVersion = -1;
+                return;
+            }
+            scheduledOutboxSyncedVersion = syncVersion;
+        }
+        // Read schedules only after cloud messages and their schedule effects
+        // have finished merging. A fixed foreground delay cannot ensure this.
         const schedules = loadAllFollowUpSchedules();
         const now = Date.now();
         for (const sched of schedules) {
@@ -768,13 +807,25 @@ export function handleFollowUpMediaAction(
     actionType: string,
     sessionId: string,
     contextMessages: ChatMessage[],
+    options?: {
+        messageId?: string;
+        saveMessage: (message: Parameters<typeof pushChatMessage>[0]) => ChatMessage;
+    },
 ) {
+    // An imported action is a real, stable system-message record. Retrying the
+    // cloud batch must not accept a second transfer or settle an order twice.
+    const existing = options?.messageId
+        ? loadChatMessages(sessionId).find(message => message.id === options.messageId)
+        : undefined;
     const targetMediaType = actionType.includes("payment_request")
         ? "payment_request"
         : actionType.includes("red_packet") ? "red_packet" : "transfer";
-    const targetMsg = [...contextMessages].reverse().find(
-        m => m.role === "user" && m.mediaType === targetMediaType && m.mediaData?.status === "pending"
-    );
+    const targetMsg = existing?.importedMediaAction
+        ? contextMessages.find(message => message.id === existing.importedMediaAction!.targetMessageId)
+        : [...contextMessages].reverse().find(
+            m => m.role === "user" && m.mediaType === targetMediaType && m.mediaData?.status === "pending"
+        );
+    if (existing && (!existing.importedMediaAction || targetMsg?.mediaData?.status !== "pending")) return existing;
     if (!targetMsg) return;
 
     const charName = resolveFollowUpSenderName(sessionId);
@@ -800,7 +851,7 @@ export function handleFollowUpMediaAction(
         newStatus = "paid";
         sysText = `${charName}接受了${userName}的代付请求`;
         rawResponseText = `[${charName}接受了${userName}的代付]`;
-        settleShoppingPaymentRequest({
+        if (!options) settleShoppingPaymentRequest({
             orderId: targetMsg.mediaData?.shoppingOrderId,
             requestId: targetMsg.mediaData?.paymentRequestId,
             accepted: true,
@@ -810,7 +861,7 @@ export function handleFollowUpMediaAction(
         newStatus = "declined";
         sysText = `${charName}拒绝了${userName}的代付请求`;
         rawResponseText = `[${charName}拒绝了${userName}的代付]`;
-        settleShoppingPaymentRequest({
+        if (!options) settleShoppingPaymentRequest({
             orderId: targetMsg.mediaData?.shoppingOrderId,
             requestId: targetMsg.mediaData?.paymentRequestId,
             accepted: false,
@@ -822,17 +873,35 @@ export function handleFollowUpMediaAction(
         rawResponseText = `[${charName}退回了${userName}的转账]`;
     }
 
+    // Queue the real action record before staging its target. Its immutable
+    // binding can recover a crash between either write; no new pending card is
+    // selected on retry. The awaited batch flush persists both and reconciles
+    // shopping separately before the original cloud row is acknowledged.
+    const actionMessage = options ? options.saveMessage({
+        sessionId,
+        role: "system",
+        content: sysText,
+        responseBatchId,
+        rawResponseText,
+        importedMediaAction: {
+            targetMessageId: targetMsg.id,
+            actionType,
+            resolvedStatus: newStatus,
+            payerCharacterName: charName,
+        },
+    }) : undefined;
+
     if (targetMediaType === "payment_request") {
         updateMessageMediaData(targetMsg.id, {
             ...targetMsg.mediaData,
             status: newStatus,
             paymentResolvedAt: new Date().toISOString(),
             paymentPayerName: charName,
-        });
+        }, options ? { persist: false } : undefined);
     } else {
-        updateMessageMediaStatus(targetMsg.id, newStatus as "opened" | "received" | "declined");
+        updateMessageMediaStatus(targetMsg.id, newStatus as "opened" | "received" | "declined", options ? { persist: false } : undefined);
     }
-    pushChatMessage({
+    return actionMessage ?? pushChatMessage({
         sessionId,
         role: "system",
         content: sysText,
@@ -883,6 +952,10 @@ export async function parseAndSaveResponse(
         senderName?: string;
         silent?: boolean;
         responseBatchId?: string;
+        /** Stable outbox identity; every record uses a semantic suffix. */
+        messageIdPrefix?: string;
+        /** Keep a cloud reply after its local input even across clock skew. */
+        replyAfterLocalMessageId?: string;
         /** 离线回端时沿用云端生成时间，避免多轮补账被“当前时间”打乱因果顺序。 */
         createdAt?: string;
         rawResponseText?: string;
@@ -896,7 +969,34 @@ export async function parseAndSaveResponse(
     const responseBatchId = options?.responseBatchId || createResponseBatchId();
     const rawResponseText = options?.rawResponseText ?? rawText;
     const reasoningText = options?.reasoningText;
-    void contextMessages;
+    const importPrefix = options?.messageIdPrefix;
+    const sourceMs = options?.createdAt ? Date.parse(options.createdAt) : NaN;
+    const anchor = options?.replyAfterLocalMessageId
+        ? loadChatMessages(sessionId).find(message => message.id === options.replyAfterLocalMessageId)
+        : undefined;
+    const anchorMs = anchor ? Date.parse(anchor.createdAt) : NaN;
+    const importBaseMs = Math.max(
+        Number.isFinite(sourceMs) ? sourceMs : Date.now(),
+        Number.isFinite(anchorMs) ? anchorMs + 1 : -Infinity,
+    );
+    const insertedMessageIds = new Set<string>();
+    const saveParsedMessage = (
+        message: Parameters<typeof pushChatMessage>[0],
+        stableKey: string,
+        timeOffset: number,
+    ): ChatMessage => {
+        if (!importPrefix) return pushChatMessage(message);
+        const result = upsertImportedChatMessage({
+            ...message,
+            id: `${importPrefix}:${stableKey}`,
+            createdAt: new Date(importBaseMs + timeOffset).toISOString(),
+            status: message.status ?? "sent",
+            responseBatchId,
+            rawResponseText,
+        });
+        if (result.inserted) insertedMessageIds.add(result.message.id);
+        return result.message;
+    };
     const sessions = loadChatSessions();
     const sess = sessions.find(s => s.id === sessionId);
     const previousState = sess && !sess.isGroup ? getLatestCharacterStateValues(sess.contactId) : [];
@@ -912,6 +1012,8 @@ export async function parseAndSaveResponse(
 
     // Detect call triggers and AI media actions, filter them out (not stored as messages)
     let triggerCall: "voice" | "video" | undefined;
+    let triggerCallPartIndex = -1;
+    let importedCallInserted = false;
     const charName = resolveFollowUpSenderName(sessionId);
 
     // 快捷动作配对消息：tool_call 存标记原文（组装器不跳过，历史上下文与模型当初
@@ -933,9 +1035,11 @@ export async function parseAndSaveResponse(
     };
 
     const filteredParts: ParsedMessagePart[] = [];
-    for (const p of parts) {
-        if (p.mediaType === "voice_call") { triggerCall = "voice"; continue; }
-        if (p.mediaType === "video_call") { triggerCall = "video"; continue; }
+    const originalPartIndices: number[] = [];
+    for (let partIndex = 0; partIndex < parts.length; partIndex++) {
+        const p = parts[partIndex];
+        if (p.mediaType === "voice_call") { triggerCall = "voice"; triggerCallPartIndex = partIndex; continue; }
+        if (p.mediaType === "video_call") { triggerCall = "video"; triggerCallPartIndex = partIndex; continue; }
         // 「丢弃角色输出的无效表情包」开关（主动消息路径）
         if (p.mediaType === "sticker" && sess?.discardInvalidStickers === true) {
             const senderIds = sess.isGroup ? (sess.participantIds ?? []) : [sess.contactId];
@@ -944,7 +1048,16 @@ export async function parseAndSaveResponse(
         if (p.mediaType === "accept_red_packet" || p.mediaType === "decline_red_packet"
             || p.mediaType === "accept_transfer" || p.mediaType === "decline_transfer"
             || p.mediaType === "accept_payment_request" || p.mediaType === "decline_payment_request") {
-            handleFollowUpMediaAction(p.mediaType, sessionId, contextMessages);
+            const actionKey = `part:${partIndex}:action`;
+            const currentMessages = importPrefix ? loadChatMessages(sessionId) : contextMessages;
+            const anchorIndex = anchor ? currentMessages.findIndex(message => message.id === anchor.id) : -1;
+            const actionContext = !importPrefix ? contextMessages
+                : anchorIndex >= 0 ? currentMessages.slice(0, anchorIndex + 1)
+                : currentMessages.filter(message => !Number.isFinite(sourceMs) || Date.parse(message.createdAt) <= sourceMs);
+            handleFollowUpMediaAction(p.mediaType, sessionId, actionContext, importPrefix ? {
+                messageId: `${importPrefix}:${actionKey}`,
+                saveMessage: message => saveParsedMessage(message, actionKey, partIndex * 10 + 5),
+            } : undefined);
             continue;
         }
         if (p.mediaType === "poke") {
@@ -955,27 +1068,30 @@ export async function parseAndSaveResponse(
                 mediaType: "poke",
                 mediaData: { pokeSender, pokeTarget },
             });
+            originalPartIndices.push(partIndex);
             continue;
         }
         filteredParts.push(p);
+        originalPartIndices.push(partIndex);
     }
 
     // Save call trigger as system message (persists even when user is not in chat room)
     if (triggerCall) {
         const callLabel = triggerCall === "voice" ? "语音通话" : "视频通话";
-        pushChatMessage({
+        const callMessage = saveParsedMessage({
             sessionId,
             role: "system",
             content: `[我发起了${callLabel}]`,
             createdAt: options?.createdAt,
             responseBatchId: createResponseBatchId(),
             rawResponseText: `[我发起了${callLabel}]`,
-        });
+        }, `part:${triggerCallPartIndex}:call`, triggerCallPartIndex * 10 + 5);
+        importedCallInserted = insertedMessageIds.has(callMessage.id);
     }
 
     if (filteredParts.length === 0) {
         if (statusPanel || innerMonologue || reasoningText) {
-            pushChatMessage({
+            saveParsedMessage({
                 sessionId,
                 role: "assistant",
                 content: "",
@@ -989,11 +1105,11 @@ export async function parseAndSaveResponse(
                 stateValues: stateValues.length > 0 ? stateValues : undefined,
                 freshStateValues,
                 ...(followUpIndex ? { followUpIndex } : {}),
-            });
+            }, "panel-only", parts.length * 10 + 5);
         }
         if (shortcutMarker) {
             const baseMs = options?.createdAt ? Date.parse(options.createdAt) : NaN;
-            pushChatMessage({
+            saveParsedMessage({
                 sessionId,
                 role: "assistant",
                 content: shortcutMarker.text,
@@ -1002,17 +1118,17 @@ export async function parseAndSaveResponse(
                 responseBatchId,
                 senderCharacterId: options?.senderCharacterId,
                 senderName: options?.senderName,
-            });
-            pushChatMessage({
+            }, "shortcut:call", parts.length * 10 + 11);
+            saveParsedMessage({
                 sessionId,
                 role: "system",
                 content: `发出快捷动作「${shortcutMarker.name}」`,
                 createdAt: Number.isFinite(baseMs) ? new Date(baseMs + 2).toISOString() : undefined,
                 mediaType: "tool_notice",
-            });
+            }, "shortcut:notice", parts.length * 10 + 12);
         }
         // Emit call trigger event for chat-room to pick up
-        if (triggerCall && typeof window !== "undefined") {
+        if (triggerCall && (!importPrefix || importedCallInserted) && typeof window !== "undefined") {
             window.dispatchEvent(new CustomEvent("ai-call-trigger", { detail: { sessionId, type: triggerCall } }));
         }
         return { hasVisible: false, newCount: MAX_FOLLOW_UPS, stateValues };
@@ -1023,6 +1139,7 @@ export async function parseAndSaveResponse(
     let metaIdx = filteredParts.findIndex(canCarryFollowUpPanel);
     if (metaIdx === -1 && (statusPanel || innerMonologue || reasoningText || stateValues.length > 0)) {
         filteredParts.push({ content: "" });
+        originalPartIndices.push(parts.length);
         metaIdx = filteredParts.length - 1;
     }
     const markerPartIdx = findShortcutMarkerPartIdx(filteredParts);
@@ -1035,7 +1152,8 @@ export async function parseAndSaveResponse(
     };
     const saveShortcutMarkerPair = () => {
         if (!shortcutMarker) return;
-        savedMessages.push(pushChatMessage({
+        const markerOffset = (originalPartIndices[markerPartIdx] ?? parts.length) * 10;
+        savedMessages.push(saveParsedMessage({
             sessionId,
             role: "assistant",
             content: shortcutMarker.text,
@@ -1044,20 +1162,20 @@ export async function parseAndSaveResponse(
             responseBatchId,
             senderCharacterId: options?.senderCharacterId,
             senderName: options?.senderName,
-        }));
-        savedMessages.push(pushChatMessage({
+        }, "shortcut:call", markerOffset + 1));
+        savedMessages.push(saveParsedMessage({
             sessionId,
             role: "system",
             content: `发出快捷动作「${shortcutMarker.name}」`,
             createdAt: nextCreatedAt(),
             mediaType: "tool_notice",
-        }));
+        }, "shortcut:notice", markerOffset + 2));
     };
     for (let i = 0; i < filteredParts.length; i++) {
         if (i === markerPartIdx) saveShortcutMarkerPair();
         const generatedPart = buildGeneratedFollowUpImageMessage(filteredParts[i]);
         const createdAt = nextCreatedAt();
-        const saved = pushChatMessage({
+        const saved = saveParsedMessage({
             sessionId,
             role: "assistant",
             content: generatedPart.content,
@@ -1076,8 +1194,8 @@ export async function parseAndSaveResponse(
             senderCharacterId: options?.senderCharacterId,
             senderName: options?.senderName,
             ...(followUpIndex ? { followUpIndex } : {}),
-        });
-        if (isPendingChatGeneratedImageMessage(saved)) {
+        }, `part:${originalPartIndices[i]}`, originalPartIndices[i] * 10 + 5);
+        if (isPendingChatGeneratedImageMessage(saved) && (!importPrefix || insertedMessageIds.has(saved.id))) {
             imageReplacementTasks.push(
                 generateAndApplyChatGeneratedImage(saved, sess?.contactId)
                     .catch(error => {
@@ -1091,7 +1209,7 @@ export async function parseAndSaveResponse(
     if (markerPartIdx >= filteredParts.length) saveShortcutMarkerPair();
 
     await dispatchBackgroundMessagesOneByOne(sessionId, savedMessages, options?.silent === true);
-    if (imageReplacementTasks.length > 0) {
+    if (imageReplacementTasks.length > 0 && !importPrefix) {
         await Promise.allSettled(imageReplacementTasks);
     }
 
@@ -1124,7 +1242,7 @@ export async function parseAndSaveResponse(
     }
 
     // Emit call trigger event for chat-room to pick up
-    if (triggerCall && typeof window !== "undefined") {
+    if (triggerCall && (!importPrefix || importedCallInserted) && typeof window !== "undefined") {
         window.dispatchEvent(new CustomEvent("ai-call-trigger", { detail: { sessionId, type: triggerCall } }));
     }
 

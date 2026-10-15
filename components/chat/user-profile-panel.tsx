@@ -40,6 +40,7 @@ import { addChatContact, createOrGetSession } from "@/lib/chat-storage";
 import { kvGet, kvSet, kvRemove } from "@/lib/kv-db";
 import { formatWalletAmount, getWalletBalance, loadWalletState, WALLET_UPDATED_EVENT } from "@/lib/wallet-storage";
 import { ChatFallbackAvatar } from "./chat-fallback-avatar";
+import { PushOutboxRecovery } from "@/components/settings/push-outbox-recovery";
 import {
     Loader2,
     Bell,
@@ -1525,6 +1526,7 @@ function OfflinePushSettingsPage({ onBack }: { onBack: () => void }) {
                         </p>
                     </>
                 )}
+                <PushOutboxRecovery />
                 <p className="menu-group-desc mx-2">定时主动消息</p>
                 <div className="menu-group">
                     <div className="menu-item">

@@ -1,4 +1,4 @@
-import { kvGet, kvSet, registerKvMigration } from "./kv-db";
+import { kvGet, kvSet, kvSetAsync, registerKvMigration } from "./kv-db";
 import type { ShoppingCategory, ShoppingSearchResult, ShoppingShippingEvent, ShoppingState } from "./shopping-types";
 import { DEFAULT_SHOPPING_REFRESH_PROMPT, DEFAULT_SHOPPING_SEARCH_PROMPT, SHOPPING_RECOMMENDATION_CATEGORIES } from "./shopping-engine";
 
@@ -244,4 +244,10 @@ export function saveShoppingState(state: ShoppingState): ShoppingState {
     window.dispatchEvent(new CustomEvent(SHOPPING_STATE_UPDATED_EVENT));
   }
   return next;
+}
+
+/** Confirm imported payment effects are durable before acknowledging a push. */
+export async function persistShoppingState(): Promise<void> {
+  const raw = kvGet(SHOPPING_STATE_KEY);
+  if (raw !== null) await kvSetAsync(SHOPPING_STATE_KEY, raw);
 }

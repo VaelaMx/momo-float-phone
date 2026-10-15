@@ -308,6 +308,7 @@ export async function armFollowUpBailout(
                         sessionId,
                         followUpIndex: count,
                         prevCount,
+                        followUpScheduleKey: `${sessionId}:${fireAt}:${prevCount}`,
                         regexes,
                         characterName: character.name,
                         userName: userIdentity?.name ?? "用户",

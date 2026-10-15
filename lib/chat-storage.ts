@@ -284,6 +284,14 @@ export type ChatMessage = {
     // [] = 本轮明确没输出（内心卡片不显示状态面板）。stateValues 仍存合并快照供状态链读取。
     freshStateValues?: StateValue[];
     followUpIndex?: number; // which follow-up round produced this message (1 = first follow-up)
+    /** A real imported action message binds its effect to one original card;
+     * retries must never pick a different pending transfer/payment. */
+    importedMediaAction?: {
+        targetMessageId: string;
+        actionType: string;
+        resolvedStatus: "opened" | "received" | "declined" | "paid";
+        payerCharacterName?: string;
+    };
     nativeToolCalls?: NativeToolCallRecord[]; // assistant native function/tool calls for prompt replay
     nativeToolResult?: NativeToolResultRecord; // tool result paired with an assistant native tool call
     nativeToolReasoning?: string; // provider reasoning content required by some tool APIs
@@ -1524,6 +1532,55 @@ export function upsertImportedChatMessage(msg: ChatMessage): { message: ChatMess
     return { message: newMsg, inserted: true };
 }
 
+/** Flush the complete imported batch before acknowledging its cloud original.
+ * Cached rows may come from a previous failed, fire-and-forget write: always
+ * write every matching row again and propagate the actual IndexedDB failure.
+ */
+export async function persistChatMessagesByBatch(sessionId: string, responseBatchId: string): Promise<ChatMessage[]> {
+    await hydrateChatStorage();
+    if (!_hydrated) throw new Error("聊天记录尚未成功加载，暂不确认云端消息。");
+    const messages = _messagesCache.filter(message =>
+        message.sessionId === sessionId && message.responseBatchId === responseBatchId,
+    );
+    const targetIds = new Set(messages.flatMap(message => message.importedMediaAction
+        ? [message.importedMediaAction.targetMessageId] : []));
+    const affectedTargets = _messagesCache.filter(message =>
+        message.sessionId === sessionId && targetIds.has(message.id),
+    );
+    // Imported targets are staged in the cache, not written ahead of their
+    // stable action record. A partial flush can be resumed through that binding.
+    await dbBulkPutMessages([...messages, ...affectedTargets]);
+    const paymentActions = messages.filter(message => message.importedMediaAction?.actionType.includes("payment_request"));
+    if (paymentActions.length > 0) {
+        const { loadShoppingState, persistShoppingState } = await import("./shopping-storage");
+        const { settleShoppingPaymentRequest } = await import("./shopping-payment-request");
+        for (const message of paymentActions) {
+            const action = message.importedMediaAction!;
+            const target = affectedTargets.find(item => item.id === action.targetMessageId);
+            if (!target || target.mediaData?.status !== action.resolvedStatus) continue;
+            const order = loadShoppingState().orders.find(item =>
+                (target.mediaData?.shoppingOrderId && item.id === target.mediaData.shoppingOrderId)
+                || (target.mediaData?.paymentRequestId && item.paymentRequestId === target.mediaData.paymentRequestId),
+            );
+            // Preserve later user decisions and settled timestamps. If the
+            // shopping write failed previously, its cached result is re-flushed
+            // below without performing settlement a second time.
+            if (order?.paymentStatus === "payment_requested") {
+                settleShoppingPaymentRequest({
+                    orderId: target.mediaData?.shoppingOrderId,
+                    requestId: target.mediaData?.paymentRequestId,
+                    accepted: action.actionType === "accept_payment_request",
+                    payerCharacterName: action.payerCharacterName,
+                });
+            }
+        }
+        // Shopping uses a different database; no cross-database atomicity is
+        // assumed. Durable action bindings make failures/restarts retryable.
+        await persistShoppingState();
+    }
+    return messages;
+}
+
 // 批量导入（聊天记录迁移专用）。旧的逐条 upsert 路径每条消息都会触发
 // loadChatSessions() 的全量预览重算（每个会话都对整张消息缓存做一次
 // filter+sort），并且目标会话 updatedAt 变化会让 sessions 表排队一次
@@ -2104,20 +2161,20 @@ export function clearFollowUpSchedule(sessionId: string): void {
 }
 
 /** Update the mediaData.status of a message (for red packet / transfer interactions). */
-export function updateMessageMediaStatus(messageId: string, newStatus: "pending" | "opened" | "received" | "declined") {
+export function updateMessageMediaStatus(messageId: string, newStatus: "pending" | "opened" | "received" | "declined", options?: { persist?: boolean }) {
     const idx = _messagesCache.findIndex(m => m.id === messageId);
     if (idx !== -1) {
         _messagesCache[idx] = { ..._messagesCache[idx], mediaData: { ..._messagesCache[idx].mediaData, status: newStatus } };
-        dbPutMessage(_messagesCache[idx]);
+        if (options?.persist !== false) dbPutMessage(_messagesCache[idx]);
     }
 }
 
 /** Update the full mediaData of a message (for group red packet claims, etc.). */
-export function updateMessageMediaData(messageId: string, data: ChatMessage["mediaData"]) {
+export function updateMessageMediaData(messageId: string, data: ChatMessage["mediaData"], options?: { persist?: boolean }) {
     const idx = _messagesCache.findIndex(m => m.id === messageId);
     if (idx !== -1) {
         _messagesCache[idx] = { ..._messagesCache[idx], mediaData: data };
-        dbPutMessage(_messagesCache[idx]);
+        if (options?.persist !== false) dbPutMessage(_messagesCache[idx]);
     }
 }
 
